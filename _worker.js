@@ -2,6 +2,20 @@ let token = "";
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
+		
+		// CORS preflight (OPTIONS) হ্যান্ডেল করুন
+		if (request.method === "OPTIONS") {
+			return new Response(null, {
+				status: 204,
+				headers: {
+					"Access-Control-Allow-Origin": "*",
+					"Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+					"Access-Control-Allow-Headers": "Range, Authorization, Content-Type",
+					"Access-Control-Max-Age": "86400",
+				},
+			});
+		}
+
 		if (url.pathname !== '/') {
 			let githubRawUrl = 'https://raw.githubusercontent.com';
 			if (new RegExp(githubRawUrl, 'i').test(url.pathname)) {
@@ -16,95 +30,110 @@ export default {
 				}
 				githubRawUrl += url.pathname;
 			}
-			//console.log(githubRawUrl);
-			
-			// 初始化请求头
+
+			// Headers তৈরি করুন
 			const headers = new Headers();
-			let authTokenSet = false; // 标记是否已经设置了认证token
-			
-			// 检查TOKEN_PATH特殊路径鉴权
+			let authTokenSet = false;
+
+			// Authorization টোকেন সেট করা (আগের মতোই)
 			if (env.TOKEN_PATH) {
 				const 需要鉴权的路径配置 = await ADD(env.TOKEN_PATH);
-				// 将路径转换为小写进行比较，防止大小写绕过
 				const normalizedPathname = decodeURIComponent(url.pathname.toLowerCase());
-
-				//检测访问路径是否需要鉴权
 				for (const pathConfig of 需要鉴权的路径配置) {
 					const configParts = pathConfig.split('@');
-					if (configParts.length !== 2) {
-						// 如果格式不正确，跳过这个配置
-						continue;
-					}
-
+					if (configParts.length !== 2) continue;
 					const [requiredToken, pathPart] = configParts;
 					const normalizedPath = '/' + pathPart.toLowerCase().trim();
-
-					// 精确匹配路径段，防止部分匹配绕过
 					const pathMatches = normalizedPathname === normalizedPath ||
 						normalizedPathname.startsWith(normalizedPath + '/');
-
 					if (pathMatches) {
 						const providedToken = url.searchParams.get('token');
-						if (!providedToken) {
-							return new Response('TOKEN不能为空', { status: 400 });
-						}
-
-						if (providedToken !== requiredToken.trim()) {
-							return new Response('TOKEN错误', { status: 403 });
-						}
-
-						// token验证成功，使用GH_TOKEN作为GitHub请求的token
-						if (!env.GH_TOKEN) {
-							return new Response('服务器GitHub TOKEN配置错误', { status: 500 });
-						}
+						if (!providedToken) return new Response('TOKEN不能为空', { status: 400 });
+						if (providedToken !== requiredToken.trim()) return new Response('TOKEN错误', { status: 403 });
+						if (!env.GH_TOKEN) return new Response('服务器GitHub TOKEN配置错误', { status: 500 });
 						headers.append('Authorization', `token ${env.GH_TOKEN}`);
 						authTokenSet = true;
-						break; // 找到匹配的路径配置后退出循环
+						break;
 					}
 				}
 			}
-			
-			// 如果TOKEN_PATH没有设置认证，使用默认token逻辑
+
 			if (!authTokenSet) {
 				if (env.GH_TOKEN && env.TOKEN) {
 					if (env.TOKEN == url.searchParams.get('token')) token = env.GH_TOKEN || token;
 					else token = url.searchParams.get('token') || token;
 				} else token = url.searchParams.get('token') || env.GH_TOKEN || env.TOKEN || token;
-				
 				const githubToken = token;
-				//console.log(githubToken);
 				if (!githubToken || githubToken == '') {
 					return new Response('TOKEN不能为空', { status: 400 });
 				}
 				headers.append('Authorization', `token ${githubToken}`);
 			}
 
-			// 发起请求
-			const response = await fetch(githubRawUrl, { headers });
+			// 🔥 মেইন ফিচার: Range হেডার ফরওয়ার্ড করুন (যদি থাকে)
+			const rangeHeader = request.headers.get('Range');
+			if (rangeHeader) {
+				headers.append('Range', rangeHeader);
+			}
 
-			// 检查请求是否成功 (状态码 200 到 299)
-			if (response.ok) {
-				return new Response(response.body, {
-					status: response.status,
-					headers: response.headers
+			// 🚀 GitHub-এ রিকোয়েস্ট পাঠান (টাইমআউট বাড়িয়ে)
+			const controller = new AbortController();
+			const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 সেকেন্ড টাইমআউট
+
+			try {
+				const response = await fetch(githubRawUrl, { 
+					headers, 
+					signal: controller.signal,
+					cf: {
+						cacheTtl: 3600, // Cloudflare CDN ক্যাশ (১ ঘণ্টা)
+						cacheEverything: true,
+					}
 				});
-			} else {
-				const errorText = env.ERROR || '无法获取文件，检查路径或TOKEN是否正确。';
-				// 如果请求不成功，返回适当的错误响应
-				return new Response(errorText, { status: response.status });
+				clearTimeout(timeoutId);
+
+				// 🌐 CORS হেডার তৈরি করুন
+				const responseHeaders = new Headers(response.headers);
+				responseHeaders.set('Access-Control-Allow-Origin', '*');
+				responseHeaders.set('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
+
+				// 💾 ক্যাশ কন্ট্রোল (প্লেয়ারকে ক্যাশ করতে বলে)
+				responseHeaders.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+
+				// 📦 রেঞ্জ রিকোয়েস্টের জন্য স্ট্যাটাস ঠিক করুন
+				let status = response.status;
+				if (rangeHeader && status === 200) {
+					// GitHub যদি পুরো ফাইল দেয়, তবুও আমরা 206 দিতে পারি (যদি Content-Range থাকে)
+					const contentRange = responseHeaders.get('Content-Range');
+					if (contentRange) {
+						status = 206; // Partial Content
+					}
+				}
+
+				return new Response(response.body, {
+					status: status,
+					headers: responseHeaders,
+				});
+
+			} catch (error) {
+				clearTimeout(timeoutId);
+				if (error.name === 'AbortError') {
+					return new Response('Request Timeout', { status: 504, headers: { 'Access-Control-Allow-Origin': '*' } });
+				}
+				return new Response('Server Error', { status: 500, headers: { 'Access-Control-Allow-Origin': '*' } });
 			}
 
 		} else {
+			// Homepage (nginx伪装)
 			const envKey = env.URL302 ? 'URL302' : (env.URL ? 'URL' : null);
 			if (envKey) {
 				const URLs = await ADD(env[envKey]);
 				const URL = URLs[Math.floor(Math.random() * URLs.length)];
 				return envKey === 'URL302' ? Response.redirect(URL, 302) : fetch(new Request(URL, request));
 			}
-			//首页改成一个nginx伪装页
 			return new Response(await nginx(), {
 				headers: {
 					'Content-Type': 'text/html; charset=UTF-8',
+					'Access-Control-Allow-Origin': '*',
 				},
 			});
 		}
@@ -143,11 +172,9 @@ async function nginx() {
 }
 
 async function ADD(envadd) {
-	var addtext = envadd.replace(/[	|"'\r\n]+/g, ',').replace(/,+/g, ',');	// 将空格、双引号、单引号和换行符替换为逗号
-	//console.log(addtext);
+	var addtext = envadd.replace(/[	|"'\r\n]+/g, ',').replace(/,+/g, ',');
 	if (addtext.charAt(0) == ',') addtext = addtext.slice(1);
 	if (addtext.charAt(addtext.length - 1) == ',') addtext = addtext.slice(0, addtext.length - 1);
 	const add = addtext.split(',');
-	//console.log(add);
 	return add;
 }
